@@ -32,39 +32,44 @@ build_async_engine_client()
    ▼
 build_async_engine_client_from_engine_args()
 └─ engine_args.create_engine_config()
-└─ VllmConfig                                               M2
+   └─ VllmConfig                                            M2
    │
    ▼
 AsyncLLM.from_vllm_config()
 ├─ Executor.get_class(vllm_config)：只选择 Executor 类
 └─ AsyncLLM(vllm_config, executor_class, ...)
    └─ AsyncLLM.__init__()
-      ├─ renderer
-      ├─ InputProcessor
-      ├─ OutputProcessor                                    M3
-      └─ EngineCoreClient.make_async_mp_client()
-         ├─ ZMQ ROUTER/PULL bind
-         ├─ launch_core_engines()                           M4
-         │
-         │   EngineCore process
-         │   └─ EngineCoreProc
-         │       ├─ handshake / identity / DP env           M5
-         │       └─ EngineCore.__init__()
-         │           ├─ Executor
-         │           │   └─ Worker.init_device()
-         │           │       └─ GPUModelRunner              M6
-         │           ├─ Worker.load_model()                 M7
-         │           ├─ KV specs/profile/config             M8
-         │           ├─ KV tensors + compile/warmup         M9
-         │           ├─ StructuredOutputManager
-         │           └─ Scheduler
-         │               └─ KVCacheManager
-         │                   └─ Coordinator/BlockPool       M10
-         │
-         ├─ proc I/O threads + READY；随后进入 busy loop     M11
-         └─ client 收齐 READY / 应用派生配置                M12
-             │
-             ▼
+      ├─ config serialization / config refs
+      ├─ optional tracer
+      ├─ request logging + stat logging policy
+      ├─ BaseRenderer / InputProcessor / OutputProcessor    M3
+      ├─ EngineCoreClient.make_async_mp_client()
+      │  ├─ ZMQ ROUTER/PULL bind
+      │  ├─ launch_core_engines()                           M4
+      │  │
+      │  │   EngineCore process
+      │  │   └─ EngineCoreProc
+      │  │       ├─ handshake / identity / DP env           M5
+      │  │       └─ EngineCore.__init__()
+      │  │           ├─ Executor
+      │  │           │   └─ Worker.init_device()
+      │  │           │       └─ GPUModelRunner              M6
+      │  │           ├─ Worker.load_model()                 M7
+      │  │           ├─ KV specs/profile/config             M8
+      │  │           ├─ KV tensors + compile/warmup         M9
+      │  │           ├─ StructuredOutputManager
+      │  │           └─ Scheduler
+      │  │               └─ KVCacheManager
+      │  │                   └─ Coordinator/BlockPool       M10
+      │  │
+      │  ├─ proc I/O threads + READY；随后进入 busy loop     M11
+      │  └─ client 收齐 READY / 应用派生配置
+      ├─ StatLoggerManager（若启用）
+      ├─ output handler（在线主路径立即启动）
+      ├─ optional frontend torch profiler
+      └─ AsyncLLM.__init__() return                         M12
+          │
+          ▼
 FastAPI app + app.state + OpenAIServing*                    M13
        │
        ▼
@@ -82,7 +87,7 @@ uvicorn listen                                              M14
 | M0 | 知识边界 | 版本/主路径锁定 | 任何对象 |
 | M1 | CLI | `AsyncEngineArgs` 存在 | config 校验 |
 | M2 | Config | `VllmConfig` 返回 | GPU 实测派生值 |
-| M3 | AsyncLLM | 前端轻组件存在 | Engine client |
+| M3 | AsyncLLM | tracer/log policy/renderer/processors 等前端基础完成 | Engine client 与后置收尾 |
 | M4 | MPClient | socket bind + process start | Engine ready |
 | M5 | Proc | 地址/identity/DP 环境 | model/KV |
 | M6 | Worker | device/distributed/runner | weights |
@@ -91,7 +96,7 @@ uvicorn listen                                              M14
 | M9 | Worker | KV physical + warmup ready | logical pool |
 | M10 | Scheduler | queues/managers/BlockPool | proc IPC threads |
 | M11 | Proc | I/O threads ready，发送 READY，随后进 busy loop | client 汇聚 |
-| M12 | AsyncLLM | client handshake complete | HTTP app |
+| M12 | AsyncLLM | client READY + logger/output handler/profiler 收尾，`__init__` 返回 | HTTP app |
 | M13 | FastAPI | state/Serving/routes ready | listen |
 | M14 | uvicorn | 对外监听 | — |
 
