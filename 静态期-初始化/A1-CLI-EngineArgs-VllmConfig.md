@@ -1,336 +1,269 @@
 # A1 · CLI → AsyncEngineArgs → VllmConfig
 
-> **阶段**：M0 → M2  
-> **主要进程**：API Server 进程  
-> **主要源码**：`vllm/entrypoints/cli/main.py`、`vllm/entrypoints/openai/api_server.py`、`vllm/engine/arg_utils.py`、`vllm/config/vllm.py`
+> **版本**：vLLM 0.24.0，V1 在线服务主路径
+>
+> **阶段**：M0 → M2
+>
+> **进程**：API Server 进程
+> **主要源码**：`vllm/entrypoints/cli/main.py`、`vllm/entrypoints/openai/api_server.py`、`vllm/engine/arg_utils.py`、`vllm/config/`
 
 ---
 
-## 1. 本阶段解决的问题
-
-用户给的是字符串和开关：
-
-```bash
-vllm serve <model> \
-  --tensor-parallel-size 2 \
-  --dtype bfloat16 \
-  --gpu-memory-utilization 0.9
-```
-
-后续组件需要的是一致、已校验、带派生值的对象图。本阶段完成两次收口：
+## 1. 本章只回答两个问题
 
 ```text
-argv / 环境变量 / 默认值
+原始输入（argv / env / defaults）
         │
         ▼
-AsyncEngineArgs                 🚩 M1：参数容器
+AsyncEngineArgs                         🚩 M1：输入边界收口
         │ create_engine_config()
         ▼
-VllmConfig                     🚩 M2：运行配置总对象
+VllmConfig                              🚩 M2：运行配置图就绪
 ```
 
-M1 仍接近用户输入；M2 才是 Engine 各层共同消费的配置契约。
+- M1 回答：原始 CLI 输入怎样脱离 `argparse.Namespace`，变成可由 Engine 层消费的参数对象？
+- M2 回答：这些较松散的参数怎样经过构造、校验和派生，变成各运行模块共享的配置契约？
+
+`setup_server()`、`run_server_worker()` 是 A1 的上游编排；`AsyncLLM.from_vllm_config()` 是 A1 的下游交接点。它们用于说明 A1 在整条服务链中的位置，不属于 `create_engine_config()` 的内部步骤。
 
 ---
 
-## 2. 在线服务入口
+## 2. 在线服务入口：调用所有权，而不是平铺时间表
 
-这一节不是在说“A1 内部同时做完了启动服务的全部事情”，而是在给 A1 标出上下文：
-
-> 整条服务启动链如何到达 A1，A1 做完 M1/M2 后又把控制流交给谁。
-
-v0.24.0 在线主路径是严格顺序，不是并列分支：
+线性箭头只能说明先后，不能说明谁调用谁、谁持有谁的生命周期。v0.24.0 在线主路径更适合写成嵌套调用树：
 
 ```text
-vllm serve
-→ CLI main / ServeSubcommand
-→ run_server()
-→ setup_server()                 # 先准备监听 socket
-→ run_server_worker()
-→ build_async_engine_client()
-→ AsyncEngineArgs.from_cli_args()
-→ build_async_engine_client_from_engine_args()
-→ engine_args.create_engine_config()
-→ AsyncLLM.from_vllm_config()
+ServeSubcommand.cmd(args: Namespace)
+└─ uvloop.run(run_server(args))
+   └─ run_server(args)
+      ├─ setup_server(args)
+      │  └─ (listen_address, sock)              # 只 bind；尚未提供 HTTP
+      │
+      └─ await run_server_worker(
+           listen_address, sock, args, **uvicorn_kwargs)
+         │
+         └─ async with build_async_engine_client(
+              args, client_config=...)
+            │
+            ├─ engine_args = AsyncEngineArgs.from_cli_args(args)
+            │                                            🚩 M1
+            │
+            └─ async with build_async_engine_client_from_engine_args(
+                 engine_args,
+                 usage_context=OPENAI_API_SERVER,
+                 client_config=...)
+               │
+               ├─ vllm_config =
+               │    engine_args.create_engine_config(usage_context)
+               │                                    🚩 M2
+               │
+               ├─ engine_client = AsyncLLM.from_vllm_config(
+               │    vllm_config,
+               │    enable_log_requests=...,
+               │    aggregate_engine_logging=...,
+               │    disable_log_stats=...,
+               │    client_addresses/count/index=...)
+               │                                    # A2，M3–M12
+               ├─ await engine_client.reset_mm_cache()
+               ├─ yield engine_client
+               └─ finally: engine_client.shutdown(...)
+            │
+            └─ build_and_serve(
+                 listen_address, sock, engine_client, args, ...)
+               └─ FastAPI/OpenAIServing/uvicorn          # A10/A11
 ```
 
-“先准备 server socket、再进行重型引擎初始化”不等于 HTTP 已经可用。真正接受请求要等到 A10 的 M14。
+这张图表达三个重要事实：
 
-### 2.1 每一层的实际意义
+1. `build_async_engine_client()` 是 **CLI 到 EngineClient 的外层异步上下文管理器**，不是 `AsyncLLM` 类的方法；
+2. 它内部先完成 M1，再委托 `build_async_engine_client_from_engine_args()` 完成 M2 和 AsyncLLM 创建；
+3. `yield engine_client` 让 HTTP 服务在 Engine 生命周期内运行；退出上下文时才逆序 shutdown。
 
-| 顺序 | 调用 | 直接作用 | 为什么需要 |
-|---|---|---|---|
-| 1 | `vllm serve` / `ServeSubcommand` | 选择在线服务子命令并进入异步主程序 | 区分 serve、bench、collect-env 等 CLI 功能 |
-| 2 | `run_server()` | 协调单 API Server worker 的完整生命周期 | 把 socket、Engine、HTTP server 串成一个有清理语义的流程 |
-| 3 | `setup_server()` | 校验 server 参数并提前 bind socket | 抢占确定端口，避免 Ray/多进程端口竞态；此时尚未对外服务 |
-| 4 | `run_server_worker()` | 在 Engine async context 内运行 HTTP server | 保证 Engine 先 ready，server 停止后 Engine 能逆序清理 |
-| 5 | `build_async_engine_client()` | CLI Namespace → `AsyncEngineArgs`，管理 EngineClient 生命周期 | 隔离 CLI 参数层与 Engine 创建/销毁 |
-| 6 | `AsyncEngineArgs.from_cli_args()` | 同名字段、默认值等收口进 dataclass | 得到 M1 参数容器，不做 GPU 工作 |
-| 7 | `build_async_engine_client_from_engine_args()` | 构造 config 和具体 EngineClient | 在线入口的 Engine 工厂/async context manager |
-| 8 | `create_engine_config()` | 子 config 构造、校验、派生并聚合 | 得到 M2 `VllmConfig` |
-| 9 | `AsyncLLM.from_vllm_config()` | 选择 Executor 并构造 AsyncLLM | 从配置阶段进入 M3–M12 的 Engine 初始化 |
+### 2.1 关键参数如何流动
 
-### 2.2 A1 真正负责的范围
+| 边界 | 关键输入 | 关键输出/用途 |
+|---|---|---|
+| `ServeSubcommand → run_server` | `args: Namespace` | 服务启动总入口 |
+| `setup_server` | host/port/socket 参数 | `listen_address, sock`；只占住端口 |
+| `build_async_engine_client` | `args`, `client_config` | `AsyncEngineArgs`，随后 yield `EngineClient` |
+| `from_cli_args` | CLI Namespace | `AsyncEngineArgs` |
+| `build_..._from_engine_args` | `engine_args`, `usage_context`, `client_config` | `VllmConfig`、`AsyncLLM` 生命周期 |
+| `create_engine_config` | `usage_context=OPENAI_API_SERVER` | 已校验/派生的 `VllmConfig` |
+| `from_vllm_config` | config、日志开关、client 地址/数量/index | 进入 A2，最终返回 `AsyncLLM` |
+| `build_and_serve` | socket、engine client、server args | 创建 app/Serving，最后启动 uvicorn |
 
-```text
-服务级调用链：
-vllm serve → ... → build_async_engine_client()
-                         │
-                         ▼
-┌────────────────────── A1 ──────────────────────┐
-│ AsyncEngineArgs.from_cli_args()          M1    │
-│ → create_engine_config()                 M2    │
-└────────────────────────────────────────────────┘
-                         │
-                         ▼
-AsyncLLM.from_vllm_config()                A2 起点
-```
-
-所以：
-
-- `setup_server()`、`run_server_worker()` 很重要，但它们是 A1 的上游服务编排，不是 `VllmConfig` 的内部构造步骤；
-- `AsyncLLM.from_vllm_config()` 是 A1 的下游交接点，不属于 M1/M2；
-- A1 的核心产物只有 `AsyncEngineArgs` 和 `VllmConfig`。
+这里只列控制流和配置语义会改变的参数；诸如 TLS、middleware、日志格式等 server 参数留在 A10。
 
 ---
 
-## 3. AsyncEngineArgs 是什么
+## 3. M1 为什么仍然是 milestone
 
-`AsyncEngineArgs` 继承/扩展 `EngineArgs`，它是 CLI 和 Engine 配置层之间的输入 DTO（Data Transfer Object，数据传输对象）：
+`AsyncEngineArgs` 确实只是参数聚合，不代表某个 GPU 或服务模块已经 ready。这里保留 M1，是因为本知识库的 milestone 同时标记两类可诊断边界：
 
-这里称 DTO 是职责描述，不是说源码中存在一个 `DTO` 父类：它主要携带数据跨越“CLI → 配置构造”边界，本身不负责模型执行。
+| 类型 | 例子 | 意义 |
+|---|---|---|
+| 轻量交接边界 | M1 | 上游原始输入已收口，下游不再依赖 CLI Namespace |
+| 模块/资源就绪 | M2–M14 | 配置图、进程、模型、KV、Scheduler、HTTP 等完成 |
 
-- 保存 model、tokenizer、dtype、quantization、max model length；
-- 保存 TP/PP/DP 和 distributed executor backend；
-- 保存 KV Cache、prefix caching、block size、显存利用率；
-- 保存 scheduling、chunked prefill、max num seqs/tokens；
-- 保存 LoRA、structured output、speculative decoding；
-- 保存 tracing、compilation、CUDA Graph 等开关；
-- 保存在线异步 Engine 所需的少量编排参数。
-
-`from_cli_args(namespace)` 的核心是把 argparse 结果按 dataclass 字段收拢。它不加载模型，不创建 CUDA context，也不启动子进程。
-
-> 🚩 **M1 · AsyncEngineArgs 就绪**
+> 🚩 **M1 · 参数输入边界完成（轻量 milestone）**
 >
-> 完成条件：CLI 值、默认值和环境影响已经进入参数容器。此时还不能认为各配置组合有效，也没有 GPU 副作用。
+> `AsyncEngineArgs.from_cli_args()` 已成功返回。CLI/default/env 的结果已进入稳定 dataclass；尚未完成跨配置校验、模型加载或任何 GPU 初始化。
+
+它的诊断价值是：
+
+- M1 前失败：通常是 CLI 解析、类型、默认值或入口参数问题；
+- M1 后、M2 前失败：通常是 config 构造、模型元数据或跨配置兼容问题；
+- 程序化入口可直接提供 `AsyncEngineArgs`，绕过 CLI，但仍复用 M2 之后的主链。
+
+因此 M1 不是“重型模块初始化完成”，而是 **配置所有权从 CLI 层移交给 Engine 参数层** 的检查点。
 
 ---
 
-## 4. create_engine_config() 的职责
+## 4. AsyncEngineArgs：输入 DTO
 
-它不是简单地把字段复制到另一个 dataclass，而是配置系统的“编译阶段”。
+`AsyncEngineArgs` 继承/扩展 `EngineArgs`。称它为 DTO（Data Transfer Object）是在描述职责，不表示源码存在 DTO 基类。
 
-这里的“编译”是类比：把较松散的用户输入解析、校验、派生成结构化运行配置；它不等同于 M9 的 `torch.compile`。为避免混淆：
+它主要携带：
 
-- **配置编译**：概念性说法，EngineArgs → VllmConfig；
-- **模型 compilation**：由 `CompilationConfig` 控制的 `torch.compile`、CUDA Graph 等执行优化准备。
+- model/tokenizer/revision/dtype/quantization/max length；
+- TP/PP/DP、distributed executor backend；
+- KV cache、prefix caching、block size、显存利用率；
+- scheduler budget、chunked prefill、stream interval；
+- LoRA、structured output、speculative decoding；
+- tracing、metrics、compilation/CUDA Graph；
+- 在线异步 Engine 的日志和编排参数。
 
-1. 读取 EngineArgs；
-2. 创建各子 config；
-3. 解析自动值与设备相关默认值；
-4. 处理互斥、依赖和兼容性；
-5. 选择/校验并行与执行后端；
-6. 根据模型特征调整 scheduler/cache/compilation；
-7. 组装 `VllmConfig`；
-8. 执行跨 config 校验和派生。
+`from_cli_args(namespace)` 主要做字段收拢；它不加载模型、不创建 CUDA context、不启动 EngineCore，也不证明任意参数组合都有效。
 
-示意：
+---
+
+## 5. M2：create_engine_config() 是配置构造边界
+
+`create_engine_config()` 不是简单改换 dataclass 外壳，而是把输入参数“构造为可运行配置图”：
 
 ```text
-EngineArgs
-├── model/tokenizer/dtype ─────────────→ ModelConfig
-├── load format/download/loader ───────→ LoadConfig
-├── device ────────────────────────────→ DeviceConfig
-├── gpu memory/block/cache dtype ──────→ CacheConfig
-├── TP/PP/DP/backend ──────────────────→ ParallelConfig
-├── max seqs/tokens/chunked prefill ───→ SchedulerConfig
-├── speculative model/method ──────────→ SpeculativeConfig?
-├── LoRA ──────────────────────────────→ LoRAConfig?
-├── structured output ─────────────────→ StructuredOutputsConfig
-├── OTLP/stat details ─────────────────→ ObservabilityConfig
-├── torch.compile/CUDA Graph ──────────→ CompilationConfig
-├── KV transfer/events ────────────────→ KVTransfer/KVEvents Config?
-└── 其他特性 ──────────────────────────→ Attention/Mamba/Kernel/Offload/...
+AsyncEngineArgs
+├─ 模型元数据/任务/dtype ───────────────→ ModelConfig
+├─ 权重来源/格式/loader ─────────────────→ LoadConfig
+├─ device ───────────────────────────────→ DeviceConfig
+├─ TP/PP/DP/backend ─────────────────────→ ParallelConfig
+├─ KV dtype/block/memory/prefix ─────────→ CacheConfig
+├─ budget/chunked prefill/stream ────────→ SchedulerConfig
+├─ OTLP/详细统计 ────────────────────────→ ObservabilityConfig
+├─ torch.compile/CUDA Graph ─────────────→ CompilationConfig
+├─ LoRA/speculative/structured output ───→ 可选子配置
+└─ KV transfer/events/attention/kernel ──→ 其他子配置
+                                             │
+                                             ▼
+                                         VllmConfig       🚩 M2
 ```
 
-问“某开关最终被谁消费”时，应沿着：
+其职责可归为四步：
+
+1. **构造**：从 EngineArgs 创建各领域子配置；
+2. **解析**：处理 `auto`、平台/设备相关默认值和模型能力；
+3. **校验**：处理互斥、依赖、并行拓扑及特性兼容；
+4. **派生/聚合**：生成跨配置派生值并装入 `VllmConfig` 聚合根。
+
+这里若使用“配置编译”一词，只是“松散输入 → 结构化运行配置”的类比，不是 M9 的 `torch.compile` 或 CUDA Graph warmup。
+
+> 🚩 **M2 · VllmConfig 配置图就绪**
+>
+> `create_engine_config()` 成功返回，各层已有统一配置契约。依赖真实模型执行/显存 profiling 的值（例如默认 KV 容量）仍要到 M8/M9 才确定。
+
+---
+
+## 6. VllmConfig 是聚合根，不是扁平字典
+
+| 配置域 | 主要回答的问题 | 典型后续消费者 |
+|---|---|---|
+| `model_config` | 跑什么模型、任务、dtype、最大长度 | renderer、Worker、ModelRunner |
+| `load_config` | 权重从哪里、怎样加载 | Executor/Worker |
+| `device_config` | 在什么设备上运行 | Worker |
+| `parallel_config` | TP/PP/DP 和后端怎样组织 | client、Executor、Worker |
+| `cache_config` | KV 格式、预算、block、prefix 策略 | profiling、KV、Scheduler |
+| `scheduler_config` | 每步 token/sequence budget 和调度策略 | OutputProcessor、Scheduler |
+| `observability_config` | tracing/metrics/详细统计怎样开启 | AsyncLLM、Worker/metrics |
+| `compilation_config` | compile/CUDA Graph 策略 | GPUModelRunner |
+| 可选配置 | LoRA、speculative、structured output、KV transfer 等 | 对应专用模块 |
+
+追踪某个 CLI 开关时，使用下面的链路：
 
 ```text
-CLI field → EngineArgs field → 子 Config field
-→ VllmConfig.xxx_config → 使用该字段的组件
+CLI field
+→ AsyncEngineArgs field
+→ 子 Config field
+→ VllmConfig.xxx_config
+→ 真正消费该字段的组件
 ```
 
-而不是只在 `AsyncLLM.__init__()` 中找同名参数。
+不要只在 `AsyncLLM.__init__()` 中寻找同名字段；很多配置直到 Worker、ModelRunner 或 Scheduler 才消费。
 
 ---
 
-## 5. VllmConfig 的结构
+## 7. M2 后配置仍可能受控写回
 
-`VllmConfig` 是配置聚合根，不是“所有字段都平铺”的巨型字典。
-
-### 5.1 模型和加载
-
-| 子配置 | 负责 |
-|---|---|
-| `model_config` | 模型结构、dtype、最大长度、runner/task、tokenizer 相关 |
-| `load_config` | 权重来源、加载格式、下载与 loader 行为 |
-| `device_config` | 目标设备 |
-| `quant_config` | 最终量化实现，常由模型和用户配置共同推导 |
-| `offload_config` | CPU/offload 等内存策略 |
-
-### 5.2 执行与并行
-
-| 子配置 | 负责 |
-|---|---|
-| `parallel_config` | TP/PP/DP、rank、backend、外部/内部 LB |
-| `compilation_config` | torch.compile、CUDA Graph、capture sizes |
-| `attention_config` | attention backend/相关行为 |
-| `kernel_config` | kernel 选择 |
-| `mamba_config` | 状态空间模型相关缓存/执行配置 |
-
-### 5.3 缓存和调度
-
-| 子配置 | 负责 |
-|---|---|
-| `cache_config` | KV dtype、显存利用率、block、prefix caching、容量结果 |
-| `scheduler_config` | token/sequence budget、策略、chunked prefill、async scheduling |
-| `kv_transfer_config` | P/D 或外部 KV 传输 |
-| `kv_events_config` | KV 事件发布 |
-
-### 5.4 可选能力
-
-| 子配置 | 负责 |
-|---|---|
-| `lora_config` | LoRA 能力 |
-| `speculative_config` | 投机解码 |
-| `structured_outputs_config` | 结构化输出 |
-| `observability_config` | tracing、迭代细节、统计 |
-
-v0.24.0 的字段集合较大且仍会演进。知识上应记住“聚合根 + 子配置职责”，不要死背某个版本的完整字段顺序。
-
----
-
-## 6. 配置不是绝对不可变
-
-“VllmConfig 在 M2 创建一次”不意味着之后字段永不变化。
-
-启动后仍可能发生受控写回：
+“配置图在 M2 就绪”不等于每个值都永远不可变：
 
 - KV profiling 后写入实际 `num_gpu_blocks`；
-- auto-fit 可能调整 `max_model_len`，并同步给 Worker；
-- KV group 结果可能回写有效 block size、cache capacity；
-- EngineCore READY 响应把 proc 端算出的关键结果同步回前端副本；
-- 某些模型能力会关闭不兼容的 chunked prefill 或 prefix caching。
+- auto-fit 可能调整 `max_model_len` 并同步给 Worker；
+- KV group 结果可写回有效 block/cache capacity；
+- EngineCore READY 响应把 proc 端派生的关键配置同步回前端副本；
+- 模型能力可能关闭不兼容的 chunked prefill/prefix caching。
 
-准确说法是：
+准确边界是：
 
-> 子 config 的对象图在 M2 完成；后续阶段主要消费它，并把依赖真实硬件/模型执行结果的少数派生字段写回。
-
-这也解释了跨进程后为什么需要 READY response：父子进程持有的是序列化后的不同对象副本，proc 端的修改不会自动共享。
+> M2 固定了配置对象图和绝大多数静态策略；依赖真实硬件、模型加载或 profiling 的少数值允许在后续节点派生并同步。
 
 ---
 
-## 7. 关键校验类型
+## 8. VllmConfig 怎样跨进程：不是运行期 ZMQ 请求
 
-### 7.1 模型内部一致性
-
-- dtype 是否可用；
-- tokenizer/model revision 是否匹配；
-- runner/task 是否由架构支持；
-- max model length 是否超出允许范围。
-
-### 7.2 并行拓扑一致性
-
-- TP/PP/DP size 与可见设备、world size；
-- executor backend 是否支持当前设备/启动方式；
-- 外部 launcher 与本地 spawn 的职责边界。
-
-### 7.3 缓存与调度一致性
-
-- block size、KV dtype、prefix caching；
-- max tokens / max seqs；
-- chunked prefill 与模型 attention 特征；
-- KV transfer 与 scheduler connector。
-
-### 7.4 编译与执行一致性
-
-- eager 与 compile/CUDA Graph；
-- capture size 与 scheduler 最大 batch；
-- 特定模型、量化或 attention backend 的限制。
-
-配置创建失败属于 M2 之前的错误；此时模型尚未加载，通常应优先检查参数组合和模型 config。
-
----
-
-## 8. VllmConfig 如何跨进程
-
-M2 后在 API Server 进程中有一份 `VllmConfig`：
+M2 后，API Server 持有原始配置对象；M3 的 `maybe_register_config_serialize_by_value()` 先注册序列化规则。真正启动 EngineCore 时，配置作为进程启动参数跨越进程边界：
 
 ```text
-API Server copy
-├── AsyncLLM 直接引用
-└── launch_core_engines(...)
-    └── multiprocessing.Process(kwargs={"vllm_config": ...})
-        └── pickle / serialize
-            └── EngineCore process copy
+API Server 中的 VllmConfig
+→ multiprocessing.Process(..., kwargs={"vllm_config": vllm_config})
+→ pickle reducer / cloudpickle
+→ EngineCore 子进程中的独立副本
 ```
 
-对于 Hugging Face 自定义 config，vLLM 会注册按值序列化支持，避免子进程重新依赖父进程中的动态类状态。
+对于 `trust_remote_code` 动态生成、位于 `transformers_modules...` 下的自定义 Transformers config 类，仅按模块路径序列化可能导致子进程无法 import。vLLM 因而注册：
 
-之后若 MultiprocExecutor 再创建 Worker，配置还会继续传入 Worker 进程。它是统一配置契约，不是共享内存。
+- `VllmConfig` 使用 cloudpickle 序列化；
+- 动态 `transformers_modules` 类定义按值携带；
+- Ray 路径同时注册 Ray cloudpickle 的按值行为。
+
+该函数只是 **注册序列化策略**，不会在调用点立即打包/发送对象。默认本地 MP 路径中，VllmConfig 主要随 `multiprocessing` spawn 参数传递；运行期 ZMQ 通道负责 Engine 请求、输出和控制消息，不应把二者混为一条传输。
+
+父子进程拿到的是不同副本，不是共享内存；这也是后续派生值需要借 READY handshake 回传的原因。
 
 ---
 
-## 9. 本阶段产物与非产物
+## 9. 本阶段产物、非产物和失败边界
 
-### 已产生
+| M2 已有 | M2 尚无 |
+|---|---|
+| `AsyncEngineArgs` | 完整 `AsyncLLM` |
+| `VllmConfig` 及子配置图 | ZMQ endpoints/client |
+| executor/backend 选择所需静态信息 | EngineCore/Worker 进程 |
+| 后续组件的统一配置契约 | CUDA context、权重、KV、Scheduler |
 
-- `AsyncEngineArgs`；
-- 聚合后的 `VllmConfig`；
-- executor/backend 选择所需的全部静态信息；
-- 后续各层读取的 config 对象图。
-
-### 尚未产生
-
-- `AsyncLLM` 实例；
-- ZMQ endpoint；
-- EngineCore/Worker 进程；
-- CUDA context；
-- GPUModelRunner；
-- 模型权重；
-- KV Cache；
-- Scheduler。
+| 最后到达点 | 优先排查 |
+|---|---|
+| M1 前 | CLI/argparse/类型/默认值 |
+| M1 已到、M2 未到 | 模型 config、参数组合、跨配置校验 |
+| M2 已到、M3 未到 | 自定义 config 序列化注册、tracing、renderer/processor |
 
 ---
 
 ## 10. 常见误区
 
-### “VllmConfig 只是参数打包”
-
-不完整。它还承载默认值解析、能力探测结果、配置间校验和部分派生策略。
-
-### “AsyncLLM.from_engine_args 是在线服务唯一入口”
-
-不准确。v0.24.0 在线 API Server 主路径会先显式构造 config，再使用 `AsyncLLM.from_vllm_config()`；编程入口和版本之间也会变化。稳定知识应放在 `create_engine_config()` 和 `from_vllm_config()` 的边界上。
-
-### “M2 后配置不会再改”
-
-不准确。硬件 profiling 结果必须在后续写回，父端还需要通过 handshake 获取关键结果。
-
-### “num_gpu_blocks 是 CLI 就能确定的”
-
-通常不是。用户可以 override，但默认容量依赖模型加载后的真实显存 profiling，见 A7。
-
----
-
-## 11. Milestone
-
-> 🚩 **M1 · 参数容器完成**
->
-> `AsyncEngineArgs.from_cli_args()` 已把 CLI/default/env 的输入收口，但尚未证明组合有效。
-
-> 🚩 **M2 · VllmConfig 完成**
->
-> `create_engine_config()` 成功返回。所有后续模块已有统一配置对象；GPU 相关的实测派生值仍待 M8/M9。
+- **“M1 表示 Engine 模块 ready”**：错。M1 是轻量输入交接点。
+- **“build_async_engine_client() 就是 AsyncLLM 构造函数”**：错。它是外层 async context manager，内部最终调用 `AsyncLLM.from_vllm_config()`。
+- **“setup_server() 后已能接 HTTP”**：错。此时只 bind socket；M14 才 listen/serve。
+- **“VllmConfig 只是参数打包”**：不完整。它还承载解析、校验、能力探测和派生策略。
+- **“M2 后配置绝不变化”**：错。硬件实测派生值会受控写回。
+- **“num_gpu_blocks 默认由 CLI 决定”**：错。通常依赖 M8 的真实显存 profiling。
 
 下一阶段：[A2-AsyncLLM前端初始化.md](A2-AsyncLLM前端初始化.md)。

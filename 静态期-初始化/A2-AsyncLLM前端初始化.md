@@ -1,522 +1,480 @@
 # A2 · AsyncLLM 前端初始化
 
-> **阶段**：M2 → M3，随后同步进入 M4–M12  
-> **进程**：API Server 进程  
-> **主要源码**：`vllm/v1/engine/async_llm.py`
-
----
-
-## 1. 定位
-
-`AsyncLLM` 是前端异步门面，实现对外的 `EngineClient` 协议。它负责：
-
-- 将用户输入转换为 EngineCore 请求；
-- 将 EngineCore 输出组装为用户可见的流式结果；
-- 管理每个前端请求的状态和输出队列；
-- 通过 `EngineCoreClient` 向 proc 端发送请求、接收输出；
-- tracing、统计、abort 和 shutdown 的前端编排。
-
-它不负责：
-
-- Scheduler 的资源决策；
-- 模型 forward；
-- GPU KV tensor；
-- 模型权重加载。
-
-```text
-OpenAIServing / 编程用户
-            │ EngineClient 协议
-            ▼
-AsyncLLM
-├── InputProcessor
-├── OutputProcessor
-├── EngineCoreClient
-└── StatLoggerManager
-            │ ZMQ
-            ▼
-EngineCoreProc
-```
-
----
-
-## 2. 构造入口
-
-v0.24.0 在线主路径使用：
-
-```text
-build_async_engine_client_from_engine_args()
-├── engine_args.create_engine_config()       # A1, M2
-└── AsyncLLM.from_vllm_config(vllm_config)
-    ├── Executor.get_class(vllm_config)
-    └── AsyncLLM(vllm_config, executor_class, ...)
-```
-
-`from_vllm_config()` 的两个关键动作：
-
-1. 根据 `parallel_config.distributed_executor_backend` 等确定 **Executor 类**；
-2. 把完整 `VllmConfig` 和 Executor 类传进 `AsyncLLM.__init__()`。
-
-这里得到的只是类选择，Executor 实例要到 EngineCore 子进程中的 A5/A6 才创建。
-
-必须区分三个符号：
-
-| 符号 | 性质 | 做什么 |
-|---|---|---|
-| `AsyncLLM.from_vllm_config(...)` | `@classmethod` 工厂入口 | 选择 Executor 类并调用 `cls(...)` |
-| `AsyncLLM(...)` | 类实例化表达式 | Python 分配实例并触发 `__init__()` |
-| `AsyncLLM.__init__(...)` | 实例初始化方法 | 建立 renderer、processor、EngineCoreClient、logger、output handler |
-
-因此说“调用 `from_vllm_config()` 拉起 AsyncLLM”在入口层面没错；下钻源码时应写成：
-
-```text
-from_vllm_config()
-→ executor_class = Executor.get_class(vllm_config)   # 只选类
-→ return cls(vllm_config, executor_class, ...)
-  → AsyncLLM.__init__()                              # 实例初始化
-```
-
-`Executor.get_class()` 不创建 Worker、CUDA context 或模型。真正的：
-
-```python
-model_executor = executor_class(vllm_config)
-```
-
-发生在 EngineCore 子进程。
-
----
-
-## 3. AsyncLLM.__init__ 的精确顺序
-
-v0.24.0 应分成三个连续阶段，而不是只列 renderer/processors。
-
-### 3.1 阶段 I：EngineCoreClient 之前的前端基础
-
-```text
-1. maybe_register_config_serialize_by_value()
-2. 保存 vllm_config / model_config / observability_config
-3. 若配置 OTLP endpoint：init_tracer(...)
-4. 保存 self.log_requests
-5. 加载自定义 StatLoggerFactory
-6. 决定 self.log_stats
-7. renderer_from_config()
-8. InputProcessor(vllm_config, renderer)
-9. OutputProcessor(renderer.tokenizer, ...)
-                                                    🚩 M3
-```
-
-对应源码职责：
-
-| 顺序 | 产物/决策 | 说明 |
-|---|---|---|
-| 1 | config 按值序列化支持 | 为自定义 Transformers config 跨进程传递做准备 |
-| 2 | 配置引用 | 后续所有前端组件从同一 `VllmConfig` 取值 |
-| 3 | tracing 基础设施 | 仅在 OTLP endpoint 存在时创建 exporter/provider |
-| 4 | 请求日志开关 | 决定是否输出 request added/finished/abort/error 日志 |
-| 5 | 自定义统计 logger factories | 加载 plugin 提供的统计后端 |
-| 6 | `self.log_stats` | 默认 stats 或自定义 logger 任一需要时为真 |
-| 7 | BaseRenderer/tokenizer | 输入渲染和 tokenizer 能力 |
-| 8 | InputProcessor | `EngineInput → EngineCoreRequest` |
-| 9 | OutputProcessor | `EngineCoreOutputs → RequestOutput`，保存 request state |
-
-> 🚩 **M3 的完整含义**
+> **版本**：vLLM 0.24.0，V1 在线服务主路径
 >
-> config 序列化准备、配置引用、可选 tracing、请求日志/统计策略、renderer、InputProcessor 和 OutputProcessor 都已完成。M3 不只包含三个可见对象。
+> **阶段**：M2 → M3，构造中同步穿越 M4–M11，最后到 M12
+>
+> **进程**：API Server 进程（EngineCore 在子进程）
+> **主要源码**：`vllm/v1/engine/async_llm.py`、`vllm/transformers_utils/config.py`、`vllm/tracing.py`
 
-### 3.2 阶段 II：同步构造 EngineCoreClient
+---
 
-```text
-10. self.engine_core = EngineCoreClient.make_async_mp_client(...)
-    ├─ ZMQ / spawn                                      M4
-    ├─ proc / Worker / model / KV / Scheduler          M5–M10
-    ├─ proc I/O + READY                                M11
-    └─ client 收齐 READY，工厂返回
-```
+## 1. 一句话定位
 
-这一行是 `AsyncLLM.__init__()` 的同步启动屏障。执行期间：
-
-- API Server event loop 所在的构造调用尚未拿到完整 AsyncLLM；
-- 大部分耗时发生在 EngineCore/Worker 进程；
-- `StatLoggerManager` 和 output handler 尚未创建；
-- M11 只是 proc 端 ready，尚不是完整 AsyncLLM 的最终完成点。
-
-### 3.3 阶段 III：Engine READY 后的前端收尾
+`AsyncLLM` 是 API Server 侧实现 `EngineClient` 协议的异步门面：它持有输入/输出处理器和 EngineCore client，把用户请求转换为核心请求，再把核心输出还原为流式结果。
 
 ```text
-11. 若 self.log_stats：
-      StatLoggerManager(
-        engine_idxs=self.engine_core.engine_ranks_managed,
-        ...
-      )
-      → logger_manager.log_engine_initialized()
-12. 保存 self._client_count
-13. self.output_handler = None
-14. 若当前线程已有 running asyncio loop：
-      self._run_output_handler()
-15. 根据 ProfilerConfig 创建可选 torch CPU profiler
-16. AsyncLLM.__init__() 返回
-                                                    🚩 M12
+FastAPI / OpenAIServing / 编程用户
+                  │ EngineClient 协议
+                  ▼
+              AsyncLLM
+              ├─ BaseRenderer/tokenizer
+              ├─ InputProcessor
+              ├─ OutputProcessor
+              ├─ StatLoggerManager（M12，可选）
+              └─ EngineCoreClient
+                     │ IPC / ZMQ runtime channels
+                     ▼
+                EngineCoreProc
 ```
 
-为什么这些操作在 EngineCoreClient 之后：
+它不做 Scheduler 的资源决策、模型 forward、权重加载或 GPU KV tensor 分配。
 
-- `StatLoggerManager` 需要 client 实际管理的 engine ranks；
-- `log_engine_initialized()` 应在 Engine 真正 READY 后记录；
-- output handler 必须从已经可用的 EngineCoreClient 拉取输出；
-- profiler 包含前端 CPU trace，其配置独立于 EngineCore 的 GPU compile/profile。
+---
 
-### 3.4 output handler 的条件性
+## 2. 工厂入口与实例初始化边界
 
-在默认 `vllm serve` 路径中，AsyncLLM 在运行中的 uvloop/asyncio loop 里构造，所以通常会在阶段 III 立即创建 output-handler task。
-
-但通用编程入口可能在没有 running loop 的同步上下文构造 AsyncLLM：
+在线主路径从 A1 的 M2 进入：
 
 ```text
-__init__ 时捕获 RuntimeError
-→ 暂不创建 task
-→ 第一次 add_request() 调 _run_output_handler()
+build_async_engine_client_from_engine_args(...)
+└─ vllm_config = engine_args.create_engine_config(...)        🚩 M2
+   └─ AsyncLLM.from_vllm_config(vllm_config, ...)
+      ├─ executor_class = Executor.get_class(vllm_config)     # 只选类
+      └─ return AsyncLLM(vllm_config, executor_class, ...)
+         └─ AsyncLLM.__init__()                               # 本章主体
 ```
 
-因此：
+| 符号 | 性质 | 作用 |
+|---|---|---|
+| `from_vllm_config()` | classmethod 工厂 | 选 Executor 类、翻译日志参数、调用 `cls(...)` |
+| `AsyncLLM(...)` | 类实例化表达式 | 分配对象并触发 `__init__()` |
+| `AsyncLLM.__init__()` | 初始化方法 | 创建前端组件，阻塞等待 EngineCore ready，再完成收尾 |
+| `Executor.get_class()` | 类选择 | 不创建 Executor/Worker/CUDA |
 
-- **在线服务主路径**：output handler 在 M12 已启动；
-- **跨入口通用语义**：M12 至少完成其管理字段和“可启动”条件，task 可延迟到首请求。
+真正的 `executor_class(vllm_config)` 实例化发生在 EngineCore 子进程，而不是 `from_vllm_config()` 中。
 
-### 3.5 完整顺序总图
+---
+
+## 3. 唯一主骨架：M3 三模块 → EngineCore 屏障 → M12 收尾
 
 ```text
 AsyncLLM.__init__()
 │
-├─ config serialization + config refs
-├─ tracing + request/stat logging policy
-├─ BaseRenderer + InputProcessor + OutputProcessor          M3
+├─ A. 配置与跨进程准备
+│   ├─ register serialization-by-value policy
+│   └─ save config refs
 │
-├─ EngineCoreClient.make_async_mp_client()
-│   └─ IPC → proc → model → KV → Scheduler → READY          M4–M11
+├─ B. 可观测性与日志策略
+│   ├─ optional tracing pipeline
+│   ├─ request logging switch
+│   ├─ custom StatLoggerFactory list
+│   └─ self.log_stats collection gate
 │
-├─ StatLoggerManager + log_engine_initialized()
-├─ output handler task（在线主路径）
+├─ C. 请求数据转换组件
+│   ├─ BaseRenderer/tokenizer
+│   ├─ InputProcessor
+│   └─ OutputProcessor
+│                                                        🚩 M3
+│
+├─ EngineCoreClient.make_async_mp_client(...)
+│   └─ IPC → proc → model → KV → Scheduler → READY      🚩 M4–M11
+│
+├─ StatLoggerManager（若 self.log_stats）
+├─ output handler（在线路径通常立即启动）
 ├─ optional frontend torch profiler
-└─ __init__ return                                           M12
+└─ AsyncLLM.__init__() return                            🚩 M12
 ```
 
----
+把 M3 概括成三个模块是合理的，但第一类不宜只叫“辅助配置”。更准确的命名是：
 
-## 4. 配置引用
+1. **配置与跨进程准备**；
+2. **可观测性与日志策略**；
+3. **请求数据转换组件（renderer + processors）**。
 
-`AsyncLLM` 保存整个 `VllmConfig`，并抽取常用引用，例如：
-
-- `model_config`；
-- `observability_config`；
-- scheduler 的 stream/output 相关配置；
-- renderer/tokenizer 所需配置。
-
-这些不是重新构造的独立 config，而是 M2 对象图中的引用。
+前两类属于控制面准备，第三类属于前端数据面。这样既简洁，也不会把 tracing/stat policy 隐藏在含义过宽的“辅助配置”中。
 
 ---
 
-## 5. Renderer
+## 4. M3-A：配置与跨进程准备
 
-`renderer_from_config(vllm_config)` 统一处理输入渲染相关能力：
+### 4.1 `maybe_register_config_serialize_by_value()` 做了什么
 
-- tokenizer（正常文本路径；显式跳过 tokenizer 初始化等场景可为 `None`）；
-- prompt/template；
-- text/token 输入规范化；
-- 多模态输入渲染接口；
-- 后续 detokenization 需要的 tokenizer 能力。
-
-它属于前端，因为用户协议中的输入输出表现不应由 GPU EngineCore 负责。
-
----
-
-## 6. InputProcessor
-
-它处在两种请求模型之间：
-
-```text
-用户/Serving 输入
-→ EngineInput / TokensPrompt / multimodal input
-→ InputProcessor
-→ EngineCoreRequest
-```
-
-启动时创建 processor 及其依赖；真正针对某个请求的处理属于运行期。
-
-典型职责：
-
-- 校验 prompt/token IDs；
-- tokenization 或接收预分词 token；
-- 合并多模态特征和占位信息；
-- 构建采样/池化相关参数；
-- 生成 EngineCore 可序列化的请求对象；
-- 根据模型长度、缓存、LoRA 等配置做前端校验。
-
-它必须在 API Server 进程，因为 tokenizer 和 HTTP 输入都在前端，且不应让 EngineCore 处理用户协议。
-
----
-
-## 7. OutputProcessor
-
-数据方向与 InputProcessor 相反：
-
-```text
-EngineCoreOutputs
-→ OutputProcessor
-→ 更新前端请求状态
-→ RequestOutput / Streaming response
-```
-
-初始化时主要保存：
-
-- tokenizer/renderer；
-- request state 容器；
-- detokenization 和 stop 条件所需结构；
-- scheduler stream interval 等输出配置；
-- completion callback / output queue 协作信息。
-
-真正消费 token、累积文本、判断 finished 属于运行期。
-
----
-
-## 8. API Server 进程中的 observability、日志和控制协议
-
-这里容易把五件事混成“观测能力”，实际应分开：
-
-| 能力 | 目的 | 类型 |
-|---|---|---|
-| tracing | 追踪一个请求跨层耗时和上下文 | observability |
-| runtime stats | 聚合 Scheduler/iteration/cache 性能数据 | observability |
-| request logging | 记录请求 ID、参数、输入或状态事件 | 普通日志 |
-| abort | 同步终止前端与 EngineCore 中的请求 | 运行时控制 |
-| shutdown | 逆序释放前端、IPC、子进程资源 | 生命周期控制 |
-
-### 8.1 tracing 初始化的意义
-
-当：
+`AsyncLLM.__init__()` 首先调用：
 
 ```python
-observability_config.otlp_traces_endpoint is not None
+maybe_register_config_serialize_by_value()
 ```
 
-时，AsyncLLM 调用：
+它解决 `trust_remote_code` 自定义 Transformers config 的类定义可达性问题。动态类常位于运行时生成的 `transformers_modules...` 模块中：父进程能 import，不代表 spawn 的子进程或另一节点也能用相同模块路径重新 import。
+
+v0.24.0 的核心策略是：
+
+```text
+VllmConfig 的 multiprocessing reducer
+└─ cloudpickle.dumps(config)
+
+动态 transformers_modules
+├─ cloudpickle.register_pickle_by_value(...)
+└─ Ray 路径也注册 ray.cloudpickle 按值行为
+```
+
+“按值”强调把动态类定义连同实例状态一起序列化；“按引用”通常只记录模块名和类名，接收端必须能重新 import。
+
+### 4.2 它不等于“立即通过 ZMQ 发 VllmConfig”
+
+必须分开三个时刻：
+
+```text
+M3：注册序列化规则
+     │ 只改变以后 pickle/cloudpickle 怎样处理对象
+     ▼
+M4：spawn EngineCore process
+     │ VllmConfig 作为 Process kwargs 被序列化到子进程
+     ▼
+运行期：ZMQ request/output/control channels
+     │ 传 EngineCoreRequest、EngineCoreOutputs、控制 RPC 等
+```
+
+因此：
+
+- 该函数调用本身不发送数据；
+- 默认本地 MP 路径的初始 VllmConfig 主要随 `multiprocessing` 进程参数传递；
+- Ray 路径使用 Ray/cloudpickle 机制；
+- 运行期 ZMQ 是另一条 IPC 数据面，不能说“这里把 VllmConfig 打包后经 ZMQ 发走”。
+
+### 4.3 配置引用
+
+随后保存：
+
+```text
+self.vllm_config
+self.model_config = vllm_config.model_config
+self.observability_config = vllm_config.observability_config
+```
+
+它们主要是 M2 对象图的引用，不是重新构造的独立 config。M3-B/C 都依赖这些引用：
+
+```text
+config refs
+├─ observability_config → tracing endpoint / detailed trace policy
+├─ scheduler_config → stream_interval
+├─ model/config fields → renderer / processors
+└─ full vllm_config → EngineCoreClient
+```
+
+---
+
+## 5. M3-B：OTLP tracing、请求日志与统计策略
+
+### 5.1 OTLP、endpoint、provider、processor、exporter
+
+**OTLP** 是 OpenTelemetry Protocol：用于把 telemetry 数据传到 OpenTelemetry Collector 或兼容后端的协议。这里关注的是 trace spans。
+
+endpoint 的来源链是：
+
+```text
+CLI --otlp-traces-endpoint
+→ AsyncEngineArgs / EngineArgs
+→ ObservabilityConfig.otlp_traces_endpoint
+→ VllmConfig.observability_config
+→ AsyncLLM.__init__()
+```
+
+当 endpoint 非空时：
 
 ```python
 init_tracer("vllm.llm_engine", tracing_endpoint)
 ```
 
-其目的不是“启动时生成一条请求 trace”，而是预先建立 OpenTelemetry 基础设施：
+概念管线：
 
-- `TracerProvider`；
-- OTLP span exporter；
-- batch span processor；
-- 模块 tracer；
-- 后续从请求 trace headers 继续父子 span 的能力。
-
-随后 `OutputProcessor` 收到：
-
-```python
-tracing_enabled=True
+```text
+业务代码创建/结束 Span
+          │
+          ▼
+Tracer（由 Provider 提供）
+          │
+          ▼
+TracerProvider
+  └─ SpanProcessor（通常批量缓冲/调度导出）
+       └─ OTLP SpanExporter
+            └─ endpoint → Collector / tracing backend
 ```
 
-在请求完成时可结合 request state、EngineCore output 和 iteration stats 记录：
+| 概念 | 职责 |
+|---|---|
+| `Tracer` | 业务代码用它创建 span |
+| `TracerProvider` | tracer 的 SDK 根对象，管理 processor/resource/sampling 等 |
+| `SpanProcessor` | 接收 span 生命周期事件，通常批量化后交给 exporter |
+| `OTLPSpanExporter` | 把已完成 span 编码为 OTLP 并发送到 endpoint |
+| endpoint | Collector/后端的目标地址，不是 vLLM 内部 ZMQ 地址 |
 
+所以 provider 和 exporter 不重复：provider 管理“如何产生/处理 trace”，exporter 负责“怎样送出完成的 span”。
+
+### 5.2 为什么它属于 tracing，主要 trace 什么
+
+M3 只装好管线，不是在启动期凭空生成请求 trace。运行期由请求携带/传播的 trace context 和 OutputProcessor 的 request state 形成 spans/attributes，典型关注：
+
+- 请求端到端延迟；
 - time to first token；
-- end-to-end latency；
-- queue/prefill/decode/inference time；
+- queue、prefill、decode/inference 等阶段耗时；
 - prompt/completion token 数；
-- request ID 和采样参数等 span attributes。
+- request ID、模型、采样参数等请求属性；
+- 配置开启的 model/worker detailed traces（更细、更有开销）。
 
-所以初始化 tracer 是“先装好追踪管线”，真正的 span/attribute 产生在运行期。
+`collect_detailed_traces` 与 endpoint 相关：没有 trace exporter 目标却请求 detailed trace 没有完整意义；详细追踪也可能增加性能开销。普通 Prometheus 指标不是 trace span，两者都属于 observability，但数据模型不同。
 
-### 8.2 请求日志
+### 5.3 三种容易混淆的“log”
 
-`enable_log_requests` 最终控制：
+| 名称 | 初始化字段/对象 | 运行期内容 |
+|---|---|---|
+| 普通请求日志 | `self.log_requests` | add/finish/abort/error 等文本事件 |
+| stats/metrics | `self.log_stats` + `StatLoggerManager` | 吞吐、时延、队列、KV/cache 等聚合统计/指标 |
+| tracing | tracer/provider/exporter | 单个请求的跨阶段 span 与上下文 |
+
+`self.log_requests` 和 `self.log_stats` 是两条独立控制链；请求文本日志不会流进 `StatLoggerManager`。
+
+### 5.4 为什么 factory、`self.log_stats`、manager 要分三步
+
+源码顺序可抽象为：
 
 ```python
-self.log_requests
+custom_stat_loggers = list(stat_loggers or [])
+custom_stat_loggers.extend(load_stat_logger_plugin_factories())
+has_custom_loggers = bool(custom_stat_loggers)
+
+self.log_stats = log_stats or has_custom_loggers
 ```
 
-它用于普通事件日志，例如：
+EngineCore READY 后才做：
 
-- request ID；
-- SamplingParams/LoRA；
-- DEBUG 级别下的 prompt/token IDs；
-- 请求完成、abort、bad request、engine dead。
+```python
+StatLoggerManager(
+    engine_idxs=self.engine_core.engine_ranks_managed,
+    custom_stat_loggers=custom_stat_loggers,
+    enable_default_loggers=log_stats,
+    ...)
+```
 
-它关注“这个请求发生了什么”，不是聚合性能指标。
+三者并不重复：
 
-### 8.3 StatLoggerManager
+| 对象/值 | M3 时是什么 | 为什么此时可确定 |
+|---|---|---|
+| `custom_stat_loggers` | factory 列表/创建配方 | 插件和用户参数已知，不需要 engine ranks |
+| `self.log_stats` | 是否收集统计的总开关 | 默认 logger 或任一 custom logger 需要数据即可为真 |
+| `StatLoggerManager` | 实际 logger 管理/路由实例 | 需要 M11 后的 `engine_ranks_managed`，所以到 M12 才创建 |
 
-统计开关与插件逻辑：
+特别重要的布尔关系：
 
 ```text
-disable_log_stats / log_stats
-→ 加载自定义 StatLoggerFactory
-→ 有自定义 logger 时，即使关闭默认 logger 也要保留统计
+self.log_stats = default_stats_enabled OR custom_logger_exists
+enable_default_loggers = default_stats_enabled
 ```
 
-`StatLoggerManager` 在 EngineCoreClient READY 后创建，原因包括：
+所以即使用户关闭默认 stats 输出，只要发现自定义 logger：
 
-- 需要 `engine_core.engine_ranks_managed`；
-- DP 下可能一个 AsyncLLM 对应多个 EngineCore；
-- proc 已返回真实配置和 Engine identity；
-- manager 要为各 EngineCore 建立/聚合 logger。
+- `self.log_stats` 仍为真，OutputProcessor/output handler 继续收集统计；
+- `enable_default_loggers` 仍为假，不会偷偷重新开启默认 logger；
+- M12 的 manager 只把数据送到自定义后端。
 
-运行期 output handler 从 EngineCoreOutputs 获得 SchedulerStats、IterationStats、多模态 cache stats 等，交给 OutputProcessor 和 StatLoggerManager 记录/输出。
-
-### 8.4 请求日志与 StatLoggerManager 的关系
-
-它们是两条独立链：
-
-```text
-enable_log_requests
-→ self.log_requests
-→ 每请求事件文本日志
-
-log_stats / custom stat loggers
-→ StatLoggerManager
-→ 吞吐、时延、队列、cache 等统计/指标
-```
-
-两者都使用配置和 logging 基础设施，但 request logging 不会“流入” StatLoggerManager。
-
-### 8.5 abort
-
-`AsyncLLM.abort()` 同时清理两侧：
-
-```text
-request IDs
-→ OutputProcessor.abort_requests()
-  └─ 清前端 request state/collector/parent-child 映射
-→ EngineCoreClient.abort_requests_async()
-  └─ 经 IPC 让 Scheduler 结束请求并释放逻辑 KV blocks
-```
-
-常见触发：
-
-- HTTP client 断开导致 generate coroutine 取消；
-- 请求处理异常；
-- 前端 stop string 已满足，但 EngineCore 尚未标 finished；
-- 用户显式 abort。
-
-### 8.6 shutdown
-
-v0.24.0 `AsyncLLM.shutdown()` 的前端逆序清理包括：
-
-```text
-shutdown_prometheus()
-→ renderer.shutdown()
-→ engine_core.shutdown(timeout)
-→ cancel output_handler task
-```
-
-EngineCoreClient 再负责 IPC、monitor、EngineCore/Worker 进程的清理。在线服务的 async context manager 在退出时调用它。
-
-“logger 在 M3 就绪”并不精确；M3 覆盖 tracer 基础、请求日志/统计策略、renderer/input/output 等前置基础，StatLoggerManager 实例和完整 AsyncLLM 要等 M12。
+`self.log_stats` 不是 logger 实例，也不是“是否打印一行日志”的开关，而是前端统计数据路径的总 gate。它必须在创建 `OutputProcessor` 和 EngineCoreClient 前确定。
 
 ---
 
-## 9. 创建 EngineCoreClient
+## 6. M3-C：Renderer、InputProcessor、OutputProcessor
 
-v0.24.0 中的正确调用关系是 `EngineCoreClient` 类方法：
+### 6.1 BaseRenderer/tokenizer
+
+```text
+self.renderer = renderer_from_config(vllm_config)
+```
+
+它统一提供 tokenizer、prompt/template、文本/token 输入规范化、多模态渲染接口以及输出 detokenization 所需能力。默认 Engine 在线路径中，它由 AsyncLLM 创建；M13 的 `OpenAIServingRender` 再复用 `engine_client.renderer`，并非重新创建同级 tokenizer。
+
+显式跳过 tokenizer 初始化等特殊配置下，`renderer.tokenizer` 可为 `None`；不要把“一定有 tokenizer”写成无条件结论。
+
+### 6.2 InputProcessor
+
+```text
+用户/Serving 输入
+→ Renderer 产出的 EngineInput / PromptType
+→ InputProcessor(vllm_config, renderer)
+→ EngineCoreRequest
+```
+
+初始化期只创建 processor 及其依赖；逐请求校验、token/多模态处理、LoRA/长度/参数检查属于运行期。
+
+### 6.3 OutputProcessor
+
+```text
+EngineCoreOutputs
+→ OutputProcessor(renderer.tokenizer, ...)
+→ 更新 request state / detokenize / stop
+→ RequestOutput / Streaming response
+```
+
+其构造依赖：
+
+- `renderer.tokenizer`；
+- M3-B 已确定的 `self.log_stats`；
+- `scheduler_config.stream_interval`；
+- tracing endpoint 是否存在。
+
+这就是 M3 内部不能任意交换所有步骤的原因。
+
+### 6.4 M3 内部依赖图
+
+```text
+A. register serialization policy
+   └─ 必须早于后面的 EngineCore spawn
+
+A. save config refs
+   ├──────────────→ B. tracing / logging policy
+   └──────────────→ C. renderer
+                         ├─→ InputProcessor
+                         └─→ OutputProcessor
+                              ▲       ▲
+                              │       └─ scheduler stream_interval
+                              └─ B.self.log_stats / tracing_enabled
+```
+
+关系总结：
+
+- serialization registration 与 renderer 没有直接数据依赖，但必须发生在 spawn 前；
+- tracing/logging policy 与 renderer 大体可独立准备；
+- renderer 必须先于两个 processor；
+- OutputProcessor 是 B、C 两条分支的汇合点；
+- 三个模块全部完成才达到 M3。
+
+> 🚩 **M3 · AsyncLLM 前端基础就绪**
+>
+> 配置/跨进程准备、可观测性/日志策略、renderer/input/output 数据转换组件均已建立。EngineCoreClient、StatLoggerManager 实例和 output handler 尚未完成。
+
+---
+
+## 7. EngineCoreClient 是 M3 与 M12 之间的同步屏障
 
 ```python
 self.engine_core = EngineCoreClient.make_async_mp_client(
     vllm_config=vllm_config,
     executor_class=executor_class,
-    ...
+    log_stats=self.log_stats,
+    client_addresses=client_addresses,
+    client_count=client_count,
+    client_index=client_index,
 )
 ```
 
-该方法根据并行配置选择并构造具体 client；不要把其他版本或设计草稿中的模块级工厂写法套到 v0.24.0。
+典型选择：
 
-工厂根据 DP/LB 配置返回：
-
-| 条件 | 典型实现 |
+| 条件 | client 形态 |
 |---|---|
 | DP=1 | `AsyncMPClient` |
-| DP>1，external LB | `DPAsyncMPClient` |
-| DP>1，内部/混合 LB | `DPLBAsyncMPClient` |
+| DP>1、external LB | `DPAsyncMPClient` |
+| DP>1、内部/混合 LB | `DPLBAsyncMPClient` |
 
-这个调用同步完成 M4–M12：建 socket、spawn、等待模型/KV/Scheduler、接收 READY。它是 `AsyncLLM.__init__()` 的启动屏障。
+工厂内部同步完成 M4–M11：ZMQ/socket、spawn、EngineCoreProc、Worker/model、KV、Scheduler、I/O threads、READY handshake。只有 client 收齐 READY 并返回，`AsyncLLM.__init__()` 才继续。
+
+因此模型加载/KV 初始化失败时可能出现：M3 已完成，但 M12 永远到不了；这时 `StatLoggerManager`、output handler 和前端 profiler 尚未创建。
 
 ---
 
-## 10. Output handler：静态对象与动态执行
+## 8. M12：Engine READY 后的前端收尾
 
-AsyncLLM 需要一个后台 asyncio task 持续：
+严格顺序：
 
 ```text
-await engine_core.get_output_async()
+1. 若 self.log_stats：
+   StatLoggerManager(engine_idxs=engine_core.engine_ranks_managed, ...)
+   └─ logger_manager.log_engine_initialized()
+2. self._client_count = client_count
+3. self.output_handler = None
+4. 若当前线程已有 running asyncio loop：_run_output_handler()
+5. 按 ProfilerConfig 创建可选前端 torch CPU profiler
+6. AsyncLLM.__init__() 返回                              🚩 M12
+```
+
+### 8.1 output handler 的条件性
+
+默认 `vllm serve` 路径在运行中的 uvloop/asyncio loop 内构造，通常在 M12 立即创建 task：
+
+```text
+engine_core.get_output_async()
 → OutputProcessor.process_outputs()
-→ 唤醒相应请求的 AsyncStream
+→ 更新 scheduler stats / abort stop-string requests
+→ StatLoggerManager.record(...)
+→ RequestOutputCollector 被唤醒
 ```
 
-需要区分：
+通用编程入口可在没有 running loop 的同步上下文构造。此时初始化捕获 `RuntimeError`，第一次 `add_request()` 再调用 `_run_output_handler()`。因此：
 
-- output handler 的管理结构在启动时准备；
-- 如果构造时已有 event loop，可立即创建 task；
-- 某些编程/测试上下文没有运行中的 loop，会延迟到第一次请求；
-- task 每次处理输出属于运行期。
+- 在线主路径：M12 通常已启动 handler task；
+- 跨入口语义：M12 至少已完成 handler 管理状态和可启动条件。
 
-所以“output handler 一定在服务启动时已经跑起来”不是跨入口成立的绝对事实；在线 API Server 路径通常有事件循环。
+### 8.2 前端 profiler 不是模型 compilation
 
----
-
-## 11. 请求流预览
-
-以下只说明静态组件的用途：
-
-```text
-AsyncLLM.generate()
-→ add_request()
-→ InputProcessor
-→ EngineCoreClient.add_request_async()
-→ ZMQ → EngineCore
-→ Scheduler / Worker
-→ ZMQ → EngineCoreClient.get_output_async()
-→ OutputProcessor
-→ AsyncGenerator yield
-```
-
-`generate()`、`add_request()`、abort 和逐 token 输出不属于本阶段。
-
----
-
-## 12. 生命周期与所有权
-
-在线服务中通常：
-
-- 一个 server worker 持有一个 `AsyncLLM`；
-- FastAPI `app.state.engine_client` 保存它；
-- 多个 `OpenAIServing*` 对象共享同一引用；
-- `AsyncLLM` 独占其 client/输出处理生命周期；
-- client 再管理 EngineCore 子进程。
-
-DP、多个 server worker 或外部 Engine 管理模式会改变数量关系，不能把“一台机器永远一个 AsyncLLM”写成普遍定律。
-
----
-
-## 13. 本阶段失败定位
-
-| 现象 | 更可能的阶段 |
-|---|---|
-| tokenizer/renderer 创建失败 | M3 |
-| OTLP/tracer 配置错误 | M3 |
-| 日志停在 EngineCore 启动前 | M3→M4 |
-| 长时间卡在 client 构造 | M4→M12，通常不是 AsyncLLM 轻组件 |
-| EngineCore 子进程 OOM | M7–M9 |
-| 收不到 READY | M5–M11 任一 proc 端失败 |
-
----
-
-## 14. Milestone
-
-> 🚩 **M3 · AsyncLLM 前端基础就绪**
->
-> config 序列化准备、配置引用、可选 tracer、请求日志/统计策略、renderer、InputProcessor、OutputProcessor 已建立。EngineCoreClient 尚未完成，StatLoggerManager/output handler/profiler 收尾也尚未完成。
+当 `profiler_config.profiler == "torch"` 且未忽略 frontend 时，M12 创建 AsyncLLM 侧 CPU profiler。它与 M9 的模型 `torch.compile`、CUDA Graph capture/warmup 是不同机制。
 
 > 🚩 **M12 · AsyncLLM 完整初始化完成**
 >
-> EngineCoreClient 已收齐 READY；StatLoggerManager（若启用）、engine-initialized 记录、output-handler 管理/在线 task、可选前端 profiler 已完成，`AsyncLLM.__init__()` 返回。
+> EngineCoreClient 已收齐 READY；统计管理器（若需要）、engine-initialized 记录、output-handler 管理/在线 task、可选前端 profiler 已完成，`AsyncLLM.__init__()` 返回。
+
+---
+
+## 9. 运行期预览：初始化对象怎样协作
+
+```text
+OpenAIServing / API route
+→ AsyncLLM.generate()/add_request()
+→ InputProcessor.process_inputs()
+→ OutputProcessor.add_request()          # 先登记前端状态
+→ EngineCoreClient.add_request_async()
+→ ZMQ → EngineCore/Scheduler/Worker
+→ EngineCoreOutputs → ZMQ
+→ output handler
+→ OutputProcessor.process_outputs()
+→ RequestOutputCollector / async generator
+→ HTTP SSE/response
+```
+
+`abort()` 同时清前端 request state 并通知 EngineCore；`shutdown()` 逆序清 Prometheus、renderer、engine client/子进程和 output-handler task。这些是运行控制/生命周期，不属于 M3 的轻组件构造。
+
+---
+
+## 10. 所有权与 FastAPI 的关系
+
+默认在线路径：
+
+- `run_server_worker()` 的 Engine async context 持有 `AsyncLLM` 生命周期；
+- M13 时 FastAPI `app.state.engine_client` 引用它；
+- 多个 `OpenAIServing*` 对象共享同一个 EngineClient/renderer；
+- `AsyncLLM` 持有 EngineCoreClient，后者管理 IPC 和 EngineCore 子进程。
+
+这不是“FastAPI 最后才初始化 AsyncLLM”，而是 **Engine 先完成 M12，FastAPI/Serving 再把它注入 app state，最后 uvicorn 到 M14**。
+
+DP、多 API server worker、外部 Engine 管理或 CPU-only render server 会改变实例数量，不能概括为“一台机器永远只有一个 AsyncLLM”。
+
+---
+
+## 11. 失败定位与常见误区
+
+| 现象 | 优先阶段 |
+|---|---|
+| 动态 Transformers config 在子进程反序列化失败 | M3-A → M4 |
+| OTLP endpoint/SDK 初始化错误 | M3-B |
+| tokenizer/renderer 创建失败 | M3-C |
+| custom logger 存在但没有统计数据 | 检查 M3-B `self.log_stats` 与 M12 manager |
+| 长时间卡在 client 构造 | M4–M11，通常不是 M3 轻组件 |
+| 收不到 READY | M5–M11 任一 proc 端失败 |
+| Engine ready 但 AsyncLLM 未返回 | M12 收尾/output handler/profiler |
+
+常见误区：
+
+- **“按值序列化就是经 ZMQ 发 config”**：错；它先注册 pickle/cloudpickle 策略。
+- **“OTLP endpoint 是 ZMQ endpoint”**：错；它是 telemetry collector/backend 地址。
+- **“self.log_stats 就是 StatLoggerManager”**：错；前者是数据收集 gate，后者是 M12 的管理器实例。
+- **“关闭默认 stats 等于自定义 logger 也停掉”**：错；有 custom factory 时 `self.log_stats` 仍为真。
+- **“M3 只有 renderer、InputProcessor、OutputProcessor”**：不完整；还包括配置跨进程准备和观测/日志策略。
 
 下一阶段：[A3-EngineCoreClient与ZMQ.md](A3-EngineCoreClient与ZMQ.md)。
