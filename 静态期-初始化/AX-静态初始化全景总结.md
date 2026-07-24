@@ -39,7 +39,7 @@ async with build_async_engine_client(args, client_config=...)
    │  └─ AsyncLLM(vllm_config, executor_class, ...)
    │     └─ AsyncLLM.__init__()
    │        ├─ A. config serialization policy + config refs
-   │        ├─ B. tracing + request/stat logging policy
+   │        ├─ B. tracing/stats/request-log 运行证据策略
    │        ├─ C. BaseRenderer + InputProcessor + OutputProcessor M3
    │        ├─ EngineCoreClient.make_async_mp_client()
    │        │  ├─ ZMQ ROUTER/PULL bind
@@ -87,7 +87,7 @@ M3 的三个块存在依赖，而非任意并列：config refs 供 B/C 使用；
 | M0 | 知识边界 | 版本/主路径锁定 | 任何对象 |
 | M1 | CLI/Engine 参数边界 | `AsyncEngineArgs` 返回；下游不再依赖原始 Namespace | config 构造与跨配置校验 |
 | M2 | Config | `VllmConfig` 返回 | GPU 实测派生值 |
-| M3 | AsyncLLM 前端 | A 配置/跨进程准备 + B 可观测性/日志策略 + C renderer/processors 完成 | Engine client 与后置收尾 |
+| M3 | AsyncLLM 前端 | A 配置/跨进程准备 + B 运行证据策略 + C renderer/processors 完成 | Engine client 与后置收尾 |
 | M4 | MPClient | socket bind + process start | Engine ready |
 | M5 | Proc | 地址/identity/DP 环境 | model/KV |
 | M6 | Worker | device/distributed/runner | weights |
@@ -345,6 +345,7 @@ LoRA         M2/M3/M6，adapter 可运行期加载
 | [A9](A9-辅助组件与可选分支.md) | 多模态、DP/TP/PP、P/D 等 |
 | [A10](A10-FastAPI-Serving与服务就绪.md) | Engine ready 到 HTTP ready |
 | [A11](A11-FastAPI-OpenAIServing-AsyncLLM关系与时序.md) | FastAPI、Serving、AsyncLLM 的对象关系与严格时序 |
+| [AX1](AX1-配置传递与最终消费链路.md) | 各配置从 CLI、VllmConfig 到前端/Core/Worker 最终消费者的链路 |
 
 ---
 
